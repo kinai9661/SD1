@@ -1,27 +1,49 @@
 import os
+import gc
+import json
+import glob
 import streamlit as st
 import torch
 import requests
+from datetime import datetime
 from tqdm import tqdm
+from dotenv import load_dotenv
 from diffusers import (
     StableDiffusionPipeline,
     StableDiffusionXLPipeline,
-    LCMScheduler,
-    EulerDiscreteScheduler,
     DPMSolverMultistepScheduler,
 )
 from diffusers.utils import load_image
-from huggingface_hub import hf_hub_download, login
+from huggingface_hub import hf_hub_download, login, HfApi, list_models
 from PIL import Image
+
+# ============== 環境變數載入 ==============
+load_dotenv()  # 載入 .env 檔案
+
+def get_secret(key, default=""):
+    """從 st.secrets 或環境變數取得設定值"""
+    try:
+        if hasattr(st, 'secrets') and key in st.secrets:
+            return st.secrets[key]
+    except:
+        pass
+    return os.getenv(key, default)
 
 # ============== 設定 ==============
 MODEL_CACHE_DIR = "./models"
 LORA_CACHE_DIR = "./loras"
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-CIVIT_TOKEN = os.getenv("CIVIT_TOKEN", "")
+OUTPUT_DIR = "./outputs"
+HISTORY_DIR = "./history"
+HF_TOKEN = get_secret("HF_TOKEN", "")
+CIVIT_TOKEN = get_secret("CIVIT_TOKEN", "")
+DEFAULT_STEPS = int(get_secret("DEFAULT_STEPS", "20"))
+DEFAULT_CFG = float(get_secret("DEFAULT_CFG", "7.0"))
+MAX_HISTORY_IMAGES = int(get_secret("MAX_HISTORY_IMAGES", "100"))
 
 os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 os.makedirs(LORA_CACHE_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(HISTORY_DIR, exist_ok=True)
 
 # ============== 預設模型 ==============
 PRESET_MODELS = {
@@ -37,6 +59,24 @@ HF_FILE_MODELS = {
     "SDXL Lightning (極速 SDXL)": ("ByteDance/SDXL-Lightning", "sdxl_lightning_4step_lora.safetensors"),
     "Pony Diffusion XL V6 (動漫/成人)": ("PonyXL_v6", "ponyxl_v6.safetensors"),
 }
+
+# ============== 記憶體管理 ==============
+def clear_memory():
+    """清理記憶體"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+def optimize_pipeline(pipe):
+    """優化管線以適應 CPU/低記憶體環境"""
+    # 啟用注意力切片以減少記憶體使用
+    if hasattr(pipe, 'enable_attention_slicing'):
+        pipe.enable_attention_slicing()
+    # 啟用 VAE 切片
+    if hasattr(pipe, 'enable_vae_slicing'):
+        pipe.enable_vae_slicing()
+    return pipe
 
 # ============== Session State 初始化 ==============
 def init_session_state():
@@ -57,6 +97,82 @@ def init_session_state():
         st.session_state.hf_token = HF_TOKEN
     if "civit_token" not in st.session_state:
         st.session_state.civit_token = CIVIT_TOKEN
+    if "hf_search_results" not in st.session_state:
+        st.session_state.hf_search_results = []
+    if "history_loaded" not in st.session_state:
+        st.session_state.history_loaded = False
+
+# ============== 圖片歷史記錄 ==============
+def save_to_history(image, prompt, neg_prompt, seed, steps, cfg, width, height, model_path):
+    """儲存圖片到歷史記錄"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{timestamp}_seed{seed}.png"
+    filepath = os.path.join(HISTORY_DIR, filename)
+    
+    # 儲存圖片
+    image.save(filepath)
+    
+    # 儲存元資料
+    metadata = {
+        "timestamp": timestamp,
+        "prompt": prompt,
+        "negative_prompt": neg_prompt,
+        "seed": seed,
+        "steps": steps,
+        "cfg": cfg,
+        "width": width,
+        "height": height,
+        "model": model_path,
+        "filename": filename
+    }
+    
+    json_path = filepath.replace(".png", ".json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    
+    return filepath
+
+def load_history():
+    """載入歷史記錄"""
+    history = []
+    json_files = sorted(glob.glob(os.path.join(HISTORY_DIR, "*.json")), reverse=True)
+    
+    for json_file in json_files[:MAX_HISTORY_IMAGES]:
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            image_path = json_file.replace(".json", ".png")
+            if os.path.exists(image_path):
+                metadata["image_path"] = image_path
+                history.append(metadata)
+        except:
+            continue
+    
+    return history
+
+# ============== HuggingFace 模型搜尋 ==============
+def search_hf_models(query, limit=10):
+    """搜尋 HuggingFace 上的 Stable Diffusion 模型"""
+    try:
+        api = HfApi()
+        models = list_models(
+            search=query,
+            task="text-to-image",
+            limit=limit,
+            token=st.session_state.hf_token if st.session_state.hf_token else None
+        )
+        results = []
+        for model in models:
+            results.append({
+                "id": model.id,
+                "downloads": model.downloads,
+                "likes": model.likes,
+                "tags": model.tags if model.tags else []
+            })
+        return results
+    except Exception as e:
+        st.error(f"搜尋失敗: {str(e)}")
+        return []
 
 # ============== 下載函數 ==============
 def download_and_backup(url, folder, civit_token="", hf_token=""):
@@ -133,6 +249,9 @@ def load_pipeline_cached(model_source, is_local_file=False, hf_token=""):
     pipe.safety_checker = None
     pipe.requires_safety_checker = False
     
+    # 優化管線以適應 CPU/低記憶體環境
+    pipe = optimize_pipeline(pipe)
+
     return pipe, model_source, is_sdxl
 
 def load_pipeline(model_source, is_local_file=False):
@@ -259,33 +378,23 @@ def clear_loras():
         return f"❌ 清除失敗: {str(e)}"
 
 # ============== 圖片生成 ==============
-def generate_image(prompt, neg_prompt, steps, cfg, seed, width, height, use_lcm):
+def generate_image(prompt, neg_prompt, steps, cfg, seed, width, height):
     """生成圖片"""
     if st.session_state.pipe is None:
         return None, "❌ 請先載入模型"
-    
+
     try:
-        # 設定 scheduler
-        if use_lcm:
-            if st.session_state.current_model_is_sdxl:
-                # SDXL Lightning
-                st.session_state.pipe.scheduler = EulerDiscreteScheduler.from_config(
-                    st.session_state.pipe.scheduler.config,
-                    timestep_spacing="trailing",
-                )
-            else:
-                # SD 1.5 LCM
-                st.session_state.pipe.scheduler = LCMScheduler.from_config(
-                    st.session_state.pipe.scheduler.config
-                )
-        else:
-            st.session_state.pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                st.session_state.pipe.scheduler.config
-            )
+        # 清理記憶體
+        clear_memory()
         
+        # 設定 scheduler (使用 DPMSolverMultistepScheduler)
+        st.session_state.pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            st.session_state.pipe.scheduler.config
+        )
+
         # 生成參數
         generator = torch.Generator("cpu").manual_seed(seed)
-        
+
         # 執行生成
         with st.spinner("生成中..."):
             result = st.session_state.pipe(
@@ -297,26 +406,41 @@ def generate_image(prompt, neg_prompt, steps, cfg, seed, width, height, use_lcm)
                 height=height,
                 generator=generator,
             )
-        
+
         image = result.images[0]
-        
-        # 儲存圖片
-        os.makedirs("./outputs", exist_ok=True)
-        timestamp = seed
-        save_path = f"./outputs/image_{timestamp}.png"
+
+        # 儲存到歷史記錄 (包含完整元資料)
+        history_path = save_to_history(
+            image, prompt, neg_prompt, seed, steps, cfg,
+            width, height, st.session_state.current_model_path
+        )
+
+        # 儲存到 outputs 資料夾 (簡單備份)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = os.path.join(OUTPUT_DIR, f"image_{timestamp}_seed{seed}.png")
         image.save(save_path)
-        
+
         # 加入到已生成列表
         st.session_state.generated_images.append({
             "image": image,
             "path": save_path,
+            "history_path": history_path,
             "prompt": prompt,
-            "seed": seed
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "width": width,
+            "height": height
         })
-        
+
+        # 生成後清理記憶體
+        clear_memory()
+
         return image, f"✅ 生成完成! 已儲存至 {save_path}"
-        
+
     except Exception as e:
+        clear_memory()
         return None, f"❌ 生成失敗: {str(e)}"
 
 # ============== 主介面 ==============
@@ -354,17 +478,23 @@ def main():
             st.success(f"目前模型: {st.session_state.current_model_path}")
         else:
             st.warning("尚未載入模型")
-        
+
         if st.session_state.active_loras:
             st.info(f"已載入 LoRA: {len(st.session_state.active_loras)} 個")
-        
+
         st.markdown("---")
-        st.header("🖼️ 圖庫")
+        st.header("🖼️ 最近生成")
         if st.session_state.generated_images:
-            for img_data in reversed(st.session_state.generated_images[-5:]):
+            for img_data in reversed(st.session_state.generated_images[-3:]):
                 st.image(img_data["image"], caption=f"Seed: {img_data['seed']}", use_container_width=True)
         else:
             st.write("尚無生成的圖片")
+        
+        # 歷史記錄連結
+        st.markdown("---")
+        st.header("📚 歷史記錄")
+        history_count = len(glob.glob(os.path.join(HISTORY_DIR, "*.json")))
+        st.write(f"已儲存 {history_count} 張圖片")
     
     # 主要內容區
     col_left, col_right = st.columns([1, 2])
@@ -372,8 +502,8 @@ def main():
     # 左側 - 模型與 LoRA 控制
     with col_left:
         # 模型選擇 Tabs
-        tab1, tab2, tab3 = st.tabs(["📦 預設模型", "📁 HF 檔案模型", "🔗 Civitai 下載"])
-        
+        tab1, tab2, tab3, tab4 = st.tabs(["📦 預設模型", "🔍 HF 搜尋", "📁 HF 檔案模型", "🔗 Civitai 下載"])
+
         with tab1:
             st.subheader("預設模型")
             preset_choice = st.selectbox(
@@ -384,8 +514,29 @@ def main():
             if st.button("載入預設模型", key="load_preset"):
                 with st.spinner("載入中..."):
                     st.session_state.status_message = handle_model_dropdown(preset_choice)
-        
+
         with tab2:
+            st.subheader("HuggingFace 模型搜尋")
+            hf_search_query = st.text_input("搜尋模型", placeholder="輸入關鍵字搜尋...", key="hf_search_query")
+            if st.button("🔍 搜尋", key="search_hf"):
+                if hf_search_query:
+                    with st.spinner("搜尋中..."):
+                        st.session_state.hf_search_results = search_hf_models(hf_search_query)
+            
+            if st.session_state.hf_search_results:
+                st.write(f"找到 {len(st.session_state.hf_search_results)} 個模型:")
+                for model in st.session_state.hf_search_results[:5]:
+                    with st.container():
+                        col_m1, col_m2 = st.columns([3, 1])
+                        with col_m1:
+                            st.write(f"**{model['id']}**")
+                            st.caption(f"⬇️ {model['downloads']:,} | ❤️ {model['likes']}")
+                        with col_m2:
+                            if st.button("載入", key=f"load_{model['id'].replace('/', '_')}"):
+                                st.session_state.status_message = load_pipeline(model['id'])
+                        st.markdown("---")
+
+        with tab3:
             st.subheader("HF 檔案模型")
             hf_choice = st.selectbox(
                 "選擇 HF 檔案模型",
@@ -395,8 +546,8 @@ def main():
             if st.button("載入 HF 模型", key="load_hf"):
                 with st.spinner("載入中..."):
                     st.session_state.status_message = handle_hf_file_model(hf_choice)
-        
-        with tab3:
+
+        with tab4:
             st.subheader("Civitai 下載")
             civit_url = st.text_input("Civitai 模型 URL", key="civit_url")
             if st.button("下載並載入", key="download_civit"):
@@ -457,8 +608,8 @@ def main():
         col_param1, col_param2, col_param3 = st.columns(3)
         
         with col_param1:
-            steps = st.slider("步數 (Steps)", 1, 50, 4 if True else 20, key="steps")
-            cfg = st.slider("CFG Scale", 1.0, 20.0, 2.0, 0.5, key="cfg")
+            steps = st.slider("步數 (Steps)", 1, 50, 20, key="steps")
+            cfg = st.slider("CFG Scale", 1.0, 20.0, 7.0, 0.5, key="cfg")
         
         with col_param2:
             width = st.select_slider(
@@ -479,20 +630,14 @@ def main():
             if seed == -1:
                 import random
                 seed = random.randint(0, 999999999)
-            
-            use_lcm = st.checkbox(
-                "⚡ 啟用極速模式 (SD1.5→LCM / SDXL→Lightning)",
-                value=True,
-                key="use_lcm"
-            )
-        
+
         # 生成按鈕
         if st.button("🎨 生成圖片", type="primary", use_container_width=True):
             if not prompt:
                 st.error("請輸入提示詞")
             else:
                 image, message = generate_image(
-                    prompt, neg_prompt, steps, cfg, seed, width, height, use_lcm
+                    prompt, neg_prompt, steps, cfg, seed, width, height
                 )
                 if image:
                     st.success(message)

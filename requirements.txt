@@ -7,4 +7,6 @@ torch>=2.1.0
 peft
 requests
 huggingface-hub
+python-dotenv
+Pillow
 

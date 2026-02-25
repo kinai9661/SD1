@@ -14,7 +14,7 @@ from diffusers import (
     DPMSolverMultistepScheduler,
 )
 from diffusers.utils import load_image
-from huggingface_hub import hf_hub_download, login, HfApi, list_models
+from huggingface_hub import hf_hub_download, login, HfApi, list_models, snapshot_download
 from PIL import Image
 
 # ============== 環境變數載入 ==============
@@ -157,7 +157,7 @@ def search_hf_models(query, limit=10):
         api = HfApi()
         models = list_models(
             search=query,
-            task="text-to-image",
+            filter="text-to-image",
             limit=limit,
             token=st.session_state.hf_token if st.session_state.hf_token else None
         )
@@ -173,6 +173,19 @@ def search_hf_models(query, limit=10):
     except Exception as e:
         st.error(f"搜尋失敗: {str(e)}")
         return []
+
+def download_hf_model(model_id):
+    """下載 HuggingFace 模型到本地快取"""
+    try:
+        with st.spinner(f"下載模型 {model_id} 中..."):
+            local_path = snapshot_download(
+                repo_id=model_id,
+                cache_dir=MODEL_CACHE_DIR,
+                token=st.session_state.hf_token if st.session_state.hf_token else None
+            )
+        return f"✅ 模型已下載至: {local_path}\n您可以在「本地模型」中載入此模型"
+    except Exception as e:
+        return f"❌ 下載失敗: {str(e)}"
 
 # ============== 下載函數 ==============
 def download_and_backup(url, folder, civit_token="", hf_token=""):
@@ -522,18 +535,24 @@ def main():
                 if hf_search_query:
                     with st.spinner("搜尋中..."):
                         st.session_state.hf_search_results = search_hf_models(hf_search_query)
-            
+
             if st.session_state.hf_search_results:
                 st.write(f"找到 {len(st.session_state.hf_search_results)} 個模型:")
                 for model in st.session_state.hf_search_results[:5]:
                     with st.container():
-                        col_m1, col_m2 = st.columns([3, 1])
+                        st.write(f"**{model['id']}**")
+                        st.caption(f"⬇️ {model['downloads']:,} | ❤️ {model['likes']}")
+                        
+                        col_m1, col_m2, col_m3 = st.columns(3)
                         with col_m1:
-                            st.write(f"**{model['id']}**")
-                            st.caption(f"⬇️ {model['downloads']:,} | ❤️ {model['likes']}")
+                            if st.button("📥 下載", key=f"dl_{model['id'].replace('/', '_')}"):
+                                st.session_state.status_message = download_hf_model(model['id'])
                         with col_m2:
-                            if st.button("載入", key=f"load_{model['id'].replace('/', '_')}"):
+                            if st.button("⚡ 直接載入", key=f"load_{model['id'].replace('/', '_')}"):
                                 st.session_state.status_message = load_pipeline(model['id'])
+                        with col_m3:
+                            # 顯示模型頁面連結
+                            st.link_button("🔗 開啟頁面", f"https://huggingface.co/{model['id']}")
                         st.markdown("---")
 
         with tab3:
